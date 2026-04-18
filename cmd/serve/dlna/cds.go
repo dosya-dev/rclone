@@ -50,8 +50,6 @@ func (cds *contentDirectoryService) cdsObjectToUpnpavObject(cdsObject object, fi
 		}
 		obj.Title = fileInfo.Name()
 		obj.Date = upnpav.Timestamp{Time: fileInfo.ModTime()}
-		obj.Searchable = 1               // Samsung TVs require searchable=1 for browseable containers
-		obj.WriteStatus = "NOT_WRITABLE" // Samsung TVs expect writeStatus for containers
 		childCount, err := cds.countChildren(cdsObject.Path)
 		if err != nil {
 			fs.Debugf(cds, "error counting children of %s: %v", cdsObject.Path, err)
