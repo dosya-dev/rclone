@@ -66,3 +66,84 @@ func TestListFilesAndFoldersSinglePage(t *testing.T) {
 		})
 	}
 }
+
+// shrinkingListServer serves names f00000..f(n-1) where n starts at before
+// and drops to after once page 1 has been served `tornPasses` times: the
+// deletes land between page reads, which is what tore the listing.
+func shrinkingListServer(t *testing.T, before, after, tornPasses int, pages *[]int) rtFunc {
+	page1Served := 0
+	return func(r *http.Request) (*http.Response, error) {
+		q := r.URL.Query()
+		page, _ := strconv.Atoi(q.Get("page"))
+		perPage, _ := strconv.Atoi(q.Get("per_page"))
+		*pages = append(*pages, page)
+		live := before
+		if page == 1 {
+			page1Served++
+			if page1Served > tornPasses {
+				live = after
+			}
+		} else {
+			live = after
+		}
+		// the deleted rows are the first before-after names, so every later
+		// row shifts back by that many
+		var files []string
+		for i := (page - 1) * perPage; i < page*perPage && i < live; i++ {
+			n := i + before - live
+			files = append(files, fmt.Sprintf(`{"id":"fil_%d","name":"f%05d.txt","size":1}`, n, n))
+		}
+		totalPages := max(1, (live+perPage-1)/perPage)
+		body := fmt.Sprintf(`{"ok":true,"files":[%s],"folders":[],`+
+			`"pagination":{"page":%d,"per_page":%d,"total_files":%d,"total_pages":%d}}`,
+			strings.Join(files, ","), page, perPage, live, totalPages)
+		return jsonResp(http.StatusOK, body), nil
+	}
+}
+
+func TestListFilesAndFoldersRereadsATornListing(t *testing.T) {
+	var pages []int
+	before, after := 2*listPageSize+50, 2*listPageSize-100
+	f := newFakeFs(shrinkingListServer(t, before, after, 1, &pages))
+
+	listing, err := f.listFilesAndFolders(context.Background(), rootID)
+	require.NoError(t, err)
+
+	// first pass is torn (page 1 at the old total, later pages at the new),
+	// the second pass is read whole at the new total
+	require.Len(t, listing.Files, after)
+	seen := map[string]bool{}
+	for _, file := range listing.Files {
+		seen[file.Name] = true
+	}
+	// every live file (the deleted ones are the first before-after names) is
+	// listed, and no deleted one is
+	for n := before - after; n < before; n++ {
+		require.True(t, seen[fmt.Sprintf("f%05d.txt", n)], "live file f%05d.txt missing", n)
+	}
+	assert.Len(t, seen, after)
+}
+
+func TestListFilesAndFoldersGivesUpOnAListingThatNeverSettles(t *testing.T) {
+	var pages []int
+	f := newFakeFs(shrinkingListServer(t, 2*listPageSize+50, listPageSize+10, 1<<30, &pages))
+
+	_, err := f.listFilesAndFolders(context.Background(), rootID)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "kept changing")
+}
+
+func TestListFilesAndFoldersAcceptsAStableShortCount(t *testing.T) {
+	// the server can count a row it then withholds; two agreeing passes win
+	var pages []int
+	f := newFakeFs(rtFunc(func(r *http.Request) (*http.Response, error) {
+		pages = append(pages, 1)
+		return jsonResp(http.StatusOK, `{"ok":true,"files":[{"id":"fil_1","name":"a.txt","size":1}],"folders":[],`+
+			`"pagination":{"page":1,"per_page":500,"total_files":2,"total_pages":1}}`), nil
+	}))
+
+	listing, err := f.listFilesAndFolders(context.Background(), rootID)
+	require.NoError(t, err)
+	assert.Len(t, listing.Files, 1)
+	assert.Len(t, pages, 2)
+}

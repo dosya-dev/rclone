@@ -145,14 +145,51 @@ func isConcurrentUploadLimit(err error) bool {
 // listPageSize is the largest page GET /api/files will serve
 const listPageSize = 500
 
+// listAttempts bounds how many times a listing is re-read when the
+// directory changes while it is being paged
+const listAttempts = 5
+
 // listFilesAndFolders lists files and folders in a directory
 //
 // The API pages files (at most listPageSize per page) but returns every
 // folder on each page, so the files from all pages are gathered and the
 // folders are taken from the first page only. Pages are ordered by name,
-// which the API tie-breaks on id, so offsets are stable between requests.
+// which the API tie-breaks on id.
+//
+// Offsets are only stable while nothing in the directory changes. A delete
+// between two page reads shifts later rows back across the boundary already
+// consumed, and the pass silently comes up short. Every page reports the
+// directory's current total_files, so a pass whose pages disagree about it
+// was torn by a concurrent change and is read again. A pass that is stable
+// but shorter than its total (the server can count rows it then withholds)
+// is only accepted once a second stable pass agrees with it.
 func (f *Fs) listFilesAndFolders(ctx context.Context, folderID string) (*api.ListResponse, error) {
-	var listing *api.ListResponse
+	var previous *api.ListResponse
+	for attempt := 1; attempt <= listAttempts; attempt++ {
+		listing, stable, err := f.listFilesAndFoldersOnce(ctx, folderID)
+		if err != nil {
+			return nil, err
+		}
+		if stable {
+			total := listing.Pagination.TotalFiles
+			if len(listing.Files) >= total {
+				return listing, nil
+			}
+			if previous != nil && previous.Pagination.TotalFiles == total && len(previous.Files) == len(listing.Files) {
+				return listing, nil
+			}
+		}
+		previous = listing
+		fs.Debugf(f, "listing of %q changed while it was read, reading it again (attempt %d/%d)", folderID, attempt, listAttempts)
+	}
+	return nil, fmt.Errorf("couldn't list files: the directory kept changing while it was read (%d attempts)", listAttempts)
+}
+
+// listFilesAndFoldersOnce reads every page of a directory once. stable is
+// false when the pages disagree about total_files, which means the directory
+// changed between two page reads and the result may be missing rows.
+func (f *Fs) listFilesAndFoldersOnce(ctx context.Context, folderID string) (listing *api.ListResponse, stable bool, err error) {
+	stable = true
 	for page := 1; ; page++ {
 		opts := rest.Opts{
 			Method: "GET",
@@ -175,18 +212,21 @@ func (f *Fs) listFilesAndFolders(ctx context.Context, folderID string) (*api.Lis
 			return shouldRetry(ctx, resp, err)
 		})
 		if err != nil {
-			return nil, fmt.Errorf("couldn't list files: %w", err)
+			return nil, false, fmt.Errorf("couldn't list files: %w", err)
 		}
 		if !result.OK {
-			return nil, fmt.Errorf("API error: %s", result.Error)
+			return nil, false, fmt.Errorf("API error: %s", result.Error)
 		}
 		if listing == nil {
 			listing = &result
 		} else {
+			if result.Pagination.TotalFiles != listing.Pagination.TotalFiles {
+				stable = false
+			}
 			listing.Files = append(listing.Files, result.Files...)
 		}
 		if page >= result.Pagination.TotalPages || len(result.Files) == 0 {
-			return listing, nil
+			return listing, stable, nil
 		}
 	}
 }
