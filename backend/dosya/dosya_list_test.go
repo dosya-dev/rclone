@@ -2,8 +2,10 @@ package dosya
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -146,4 +148,180 @@ func TestListFilesAndFoldersAcceptsAStableShortCount(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, listing.Files, 1)
 	assert.Len(t, pages, 2)
+}
+
+// keysetListServer serves GET /api/files the way a server with keyset paging
+// does: an empty cursor asks for the first page, every page answers
+// next_cursor (null once the listing is done), and a page starts strictly
+// after the cursor's (name, id). The cursor format is the fake's own, which
+// is fine because the client must treat it as opaque. afterPage runs once
+// each page has been served, so a test can change the directory between
+// two page reads.
+type keysetFile struct{ id, name string }
+
+func keysetListServer(t *testing.T, files *[]keysetFile, afterPage func(served int)) rtFunc {
+	served := 0
+	return func(r *http.Request) (*http.Response, error) {
+		require.Equal(t, "/api/files", r.URL.Path)
+		q := r.URL.Query()
+		require.True(t, q.Has("cursor"), "a keyset server is only asked with a cursor parameter")
+		perPage, _ := strconv.Atoi(q.Get("per_page"))
+		require.Positive(t, perPage)
+
+		live := append([]keysetFile(nil), (*files)...)
+		sort.Slice(live, func(i, j int) bool {
+			if live[i].name != live[j].name {
+				return live[i].name < live[j].name
+			}
+			return live[i].id < live[j].id
+		})
+		start := 0
+		if c := q.Get("cursor"); c != "" {
+			name, id, ok := strings.Cut(c, "|")
+			require.True(t, ok)
+			start = sort.Search(len(live), func(i int) bool {
+				return live[i].name > name || (live[i].name == name && live[i].id > id)
+			})
+		}
+		end := min(start+perPage, len(live))
+		var out []string
+		for _, file := range live[start:end] {
+			out = append(out, fmt.Sprintf(`{"id":%q,"name":%q,"size":1}`, file.id, file.name))
+		}
+		next := "null"
+		if end-start == perPage {
+			last := live[end-1]
+			b, _ := json.Marshal(last.name + "|" + last.id)
+			next = string(b)
+		}
+		body := fmt.Sprintf(`{"ok":true,"files":[%s],"folders":[{"id":"fld_1","name":"sub"}],`+
+			`"pagination":{"page":1,"per_page":%d,"total_files":%d,"total_pages":1,"next_cursor":%s}}`,
+			strings.Join(out, ","), perPage, len(live), next)
+		served++
+		if afterPage != nil {
+			afterPage(served)
+		}
+		return jsonResp(http.StatusOK, body), nil
+	}
+}
+
+func keysetFiles(n int) []keysetFile {
+	files := make([]keysetFile, n)
+	for i := range files {
+		files[i] = keysetFile{id: fmt.Sprintf("fil_%d", i), name: fmt.Sprintf("f%05d.txt", i)}
+	}
+	return files
+}
+
+func TestListFilesAndFoldersFollowsTheCursor(t *testing.T) {
+	files := keysetFiles(2*listPageSize + 7)
+	pages := 0
+	f := newFakeFs(keysetListServer(t, &files, func(served int) { pages = served }))
+
+	listing, err := f.listFilesAndFolders(context.Background(), rootID)
+	require.NoError(t, err)
+
+	assert.Equal(t, 3, pages)
+	require.Len(t, listing.Files, 2*listPageSize+7)
+	assert.Equal(t, "f01006.txt", listing.Files[len(listing.Files)-1].Name)
+	assert.Len(t, listing.Folders, 1)
+}
+
+func TestListFilesAndFoldersKeysetSurvivesARenameDuringPaging(t *testing.T) {
+	// A file already listed on page 1 is renamed past the end of the
+	// directory before page 2 is read. total_files does not move, so the
+	// offset re-read cannot see it, and offset paging would start page 2 one
+	// row late and silently skip the file that slid into its first slot.
+	// The cursor pages after the last name read, so nothing untouched is
+	// skipped, and the renamed file is listed once, under its new name.
+	n := 2*listPageSize + 7
+	files := keysetFiles(n)
+	f := newFakeFs(keysetListServer(t, &files, func(served int) {
+		if served == 1 {
+			files[0].name = "zzz-renamed.txt"
+		}
+	}))
+
+	listing, err := f.listFilesAndFolders(context.Background(), rootID)
+	require.NoError(t, err)
+
+	byID := map[string]string{}
+	for _, file := range listing.Files {
+		_, dup := byID[file.ID]
+		require.False(t, dup, "file %s listed twice", file.ID)
+		byID[file.ID] = file.Name
+	}
+	require.Len(t, byID, n)
+	for i := 1; i < n; i++ {
+		assert.Equal(t, fmt.Sprintf("f%05d.txt", i), byID[fmt.Sprintf("fil_%d", i)], "untouched file fil_%d", i)
+	}
+	assert.Equal(t, "zzz-renamed.txt", byID["fil_0"])
+}
+
+func TestListFilesAndFoldersKeysetSurvivesADeletePlusUpload(t *testing.T) {
+	// One row on page 1 is deleted and a new one uploaded before page 2:
+	// the total stays the same, which is the shape offset paging accepted
+	// with a live file missing.
+	n := 2*listPageSize + 7
+	files := keysetFiles(n)
+	f := newFakeFs(keysetListServer(t, &files, func(served int) {
+		if served == 1 {
+			files = append(files[1:], keysetFile{id: "fil_new", name: "f99999.txt"})
+		}
+	}))
+
+	listing, err := f.listFilesAndFolders(context.Background(), rootID)
+	require.NoError(t, err)
+
+	seen := map[string]bool{}
+	for _, file := range listing.Files {
+		seen[file.ID] = true
+	}
+	for i := 1; i < n; i++ {
+		require.True(t, seen[fmt.Sprintf("fil_%d", i)], "live file fil_%d missing", i)
+	}
+	assert.True(t, seen["fil_new"])
+}
+
+func TestListFilesAndFoldersRereadsWhenTheCursorStopsMidPass(t *testing.T) {
+	// An upgrade rolling out mid-listing: page 1 came from a keyset server
+	// and page 2 from one that pages by offset. That pass cannot be trusted,
+	// so it is read again, and the second pass (all offset) is accepted.
+	total := listPageSize + 3
+	calls := 0
+	f := newFakeFs(rtFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		q := r.URL.Query()
+		page, _ := strconv.Atoi(q.Get("page"))
+		perPage, _ := strconv.Atoi(q.Get("per_page"))
+		var out []string
+		for i := (page - 1) * perPage; i < page*perPage && i < total; i++ {
+			out = append(out, fmt.Sprintf(`{"id":"fil_%d","name":"f%05d.txt","size":1}`, i, i))
+		}
+		cursor := ""
+		if calls == 1 {
+			cursor = fmt.Sprintf(`,"next_cursor":"f%05d.txt|fil_%d"`, perPage-1, perPage-1)
+		}
+		body := fmt.Sprintf(`{"ok":true,"files":[%s],"folders":[],`+
+			`"pagination":{"page":%d,"per_page":%d,"total_files":%d,"total_pages":2%s}}`,
+			strings.Join(out, ","), page, perPage, total, cursor)
+		return jsonResp(http.StatusOK, body), nil
+	}))
+
+	listing, err := f.listFilesAndFolders(context.Background(), rootID)
+	require.NoError(t, err)
+	assert.Len(t, listing.Files, total)
+	assert.Equal(t, 4, calls)
+}
+
+func TestListFilesAndFoldersAsksForTheCursorOnlyOnTheFirstOffsetPage(t *testing.T) {
+	var asked []bool
+	f := newFakeFs(rtFunc(func(r *http.Request) (*http.Response, error) {
+		asked = append(asked, r.URL.Query().Has("cursor"))
+		return fakeListServer(t, 2*listPageSize+7, new([]int))(r)
+	}))
+
+	_, err := f.listFilesAndFolders(context.Background(), rootID)
+	require.NoError(t, err)
+	assert.Equal(t, []bool{true, false, false}, asked)
 }

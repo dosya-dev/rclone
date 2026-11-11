@@ -156,19 +156,33 @@ const listAttempts = 5
 // folders are taken from the first page only. Pages are ordered by name,
 // which the API tie-breaks on id.
 //
-// Offsets are only stable while nothing in the directory changes. A delete
+// A current server pages by keyset: each page names the last (name, id) it
+// returned as next_cursor and the next page starts strictly after it, so a
+// rename or a delete plus an upload between two page reads can never make
+// an untouched file fall between pages. At worst the file that changed
+// shows up once under each name (deduplicated by id, the later read wins)
+// or not at all, which is the honest answer for a file renamed mid-read.
+// Such a pass is accepted as it stands.
+//
+// An older server ignores the cursor parameter and pages by offset, and
+// offsets are only stable while nothing in the directory changes. A delete
 // between two page reads shifts later rows back across the boundary already
 // consumed, and the pass silently comes up short. Every page reports the
 // directory's current total_files, so a pass whose pages disagree about it
 // was torn by a concurrent change and is read again. A pass that is stable
 // but shorter than its total (the server can count rows it then withholds)
-// is only accepted once a second stable pass agrees with it.
+// is only accepted once a second stable pass agrees with it. A rename does
+// not change the total, which is the gap the cursor closes.
 func (f *Fs) listFilesAndFolders(ctx context.Context, folderID string) (*api.ListResponse, error) {
 	var previous *api.ListResponse
 	for attempt := 1; attempt <= listAttempts; attempt++ {
-		listing, stable, err := f.listFilesAndFoldersOnce(ctx, folderID)
+		listing, stable, keyset, err := f.listFilesAndFoldersOnce(ctx, folderID)
 		if err != nil {
 			return nil, err
+		}
+		if keyset {
+			listing.Files = dedupeFilesByID(listing.Files)
+			return listing, nil
 		}
 		if stable {
 			total := listing.Pagination.TotalFiles
@@ -185,11 +199,36 @@ func (f *Fs) listFilesAndFolders(ctx context.Context, folderID string) (*api.Lis
 	return nil, fmt.Errorf("couldn't list files: the directory kept changing while it was read (%d attempts)", listAttempts)
 }
 
-// listFilesAndFoldersOnce reads every page of a directory once. stable is
-// false when the pages disagree about total_files, which means the directory
-// changed between two page reads and the result may be missing rows.
-func (f *Fs) listFilesAndFoldersOnce(ctx context.Context, folderID string) (listing *api.ListResponse, stable bool, err error) {
+// dedupeFilesByID keeps one entry per file id. A file renamed past the
+// cursor while a keyset listing is read comes back a second time under its
+// new name; the later read is the current one, so it replaces the earlier.
+func dedupeFilesByID(files []api.FileItem) []api.FileItem {
+	index := make(map[string]int, len(files))
+	out := files[:0]
+	for _, file := range files {
+		if i, ok := index[file.ID]; ok {
+			out[i] = file
+			continue
+		}
+		index[file.ID] = len(out)
+		out = append(out, file)
+	}
+	return out
+}
+
+// listFilesAndFoldersOnce reads every page of a directory once.
+//
+// It asks for keyset paging (an empty cursor parameter on the first page)
+// and keyset is true when the server answered with next_cursor on every
+// page. Otherwise it is an older server paging by offset, and stable is
+// false when the pages disagree about total_files, which means the
+// directory changed between two page reads and the result may be missing
+// rows. A server that stops sending next_cursor part way through (an
+// upgrade rolling out mid-listing) leaves a pass that is neither, so it is
+// read again.
+func (f *Fs) listFilesAndFoldersOnce(ctx context.Context, folderID string) (listing *api.ListResponse, stable bool, keyset bool, err error) {
 	stable = true
+	cursor := ""
 	for page := 1; ; page++ {
 		opts := rest.Opts{
 			Method: "GET",
@@ -205,6 +244,12 @@ func (f *Fs) listFilesAndFoldersOnce(ctx context.Context, folderID string) (list
 		if folderID != "" && folderID != rootID {
 			opts.Parameters["folder_id"] = []string{folderID}
 		}
+		// Only the first page asks, and only a keyset pass keeps asking: an
+		// empty cursor on a later offset page would make an upgraded server
+		// start over from the first row.
+		if page == 1 || keyset {
+			opts.Parameters["cursor"] = []string{cursor}
+		}
 
 		var result api.ListResponse
 		err := f.pacer.Call(func() (bool, error) {
@@ -212,21 +257,40 @@ func (f *Fs) listFilesAndFoldersOnce(ctx context.Context, folderID string) (list
 			return shouldRetry(ctx, resp, err)
 		})
 		if err != nil {
-			return nil, false, fmt.Errorf("couldn't list files: %w", err)
+			return nil, false, false, fmt.Errorf("couldn't list files: %w", err)
 		}
 		if !result.OK {
-			return nil, false, fmt.Errorf("API error: %s", result.Error)
+			return nil, false, false, fmt.Errorf("API error: %s", result.Error)
 		}
+		next := result.Pagination.NextCursor
 		if listing == nil {
 			listing = &result
+			keyset = next.Present
 		} else {
+			if keyset && !next.Present {
+				// the rest of this pass came from a server paging by
+				// offset, which cannot be stitched onto keyset pages
+				keyset = false
+				stable = false
+			}
+			if !keyset && next.Present {
+				// an offset pass that reached an upgraded server mid-read
+				stable = false
+			}
 			if result.Pagination.TotalFiles != listing.Pagination.TotalFiles {
 				stable = false
 			}
 			listing.Files = append(listing.Files, result.Files...)
 		}
+		if keyset {
+			if next.Value == "" || len(result.Files) == 0 {
+				return listing, stable, true, nil
+			}
+			cursor = next.Value
+			continue
+		}
 		if page >= result.Pagination.TotalPages || len(result.Files) == 0 {
-			return listing, stable, nil
+			return listing, stable, false, nil
 		}
 	}
 }

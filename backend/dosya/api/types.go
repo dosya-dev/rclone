@@ -1,7 +1,10 @@
 // Package api has type definitions for dosya.dev
 package api
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // Response is the base response wrapper
 type Response struct {
@@ -77,6 +80,29 @@ type Pagination struct {
 	PerPage    int `json:"per_page"`
 	TotalFiles int `json:"total_files"`
 	TotalPages int `json:"total_pages"`
+	// NextCursor is only sent by a server that serves keyset paging, and
+	// only when the request asked for it with a cursor parameter
+	NextCursor Cursor `json:"next_cursor"`
+}
+
+// Cursor is the keyset position GET /api/files returns as next_cursor.
+//
+// Present tells a server that pages by cursor apart from an older one that
+// never sends the field. A present but null or empty cursor means the
+// listing has no more pages.
+type Cursor struct {
+	Present bool
+	Value   string
+}
+
+// UnmarshalJSON records that next_cursor was sent, including as null
+func (c *Cursor) UnmarshalJSON(data []byte) error {
+	c.Present = true
+	c.Value = ""
+	if string(data) == "null" {
+		return nil
+	}
+	return json.Unmarshal(data, &c.Value)
 }
 
 // CreateFolderRequest is the request body for POST /api/folders
